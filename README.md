@@ -77,7 +77,7 @@ python eval.py --data_path /path/to/test \
 
 ## Model Weights
 
-[Download best_model.pth (~150 MB) — Google Drive](https://drive.google.com/file/d/17pHEZLWeh0milq3EPz2ExbzcVvZzkYCO/view?usp=sharing)
+[Download best_model.pth (~150 MB) — Google Drive](https://drive.google.com/file/d/153EytW7BPQWjWBL3MmQqYoWuc0aP6K9o/view?usp=drive_link)
 
 ---
 
