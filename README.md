@@ -61,7 +61,7 @@ Update paths in `config.yaml` to match your local layout.
 ## Training
 
 ```bash
-python train.py --config config.yaml
+python train.py --config config.yaml --data_dir /path/to/galaxeye-dataset
 ```
 
 ---
@@ -85,10 +85,11 @@ python eval.py --data_path /path/to/test \
 
 | Split | Threshold | IoU    | Precision | Recall | F1     |
 |-------|-----------|--------|-----------|--------|--------|
-| Val   | 0.70      | 0.4844 | 0.6947    | 0.6154 | 0.6527 |
-| Test  | 0.05      | 0.0392 | 0.0578    | 0.1091 | 0.0755 |
+| Val   | 0.70      | 0.5774 | 0.6384    | 0.8581 | 0.7321 |
+| Test  | 0.10      | 0.0303 | 0.0971    | 0.0422 | 0.0588 |
+| Test (change tiles only, 60 tiles) | 0.10 | 0.0303 | 0.0971 | 0.0422 | 0.0588 |
 
-> **Note:** Test set (scene_09, scene_10) represents unseen disaster events. Diagnostic analysis confirmed domain shift — model confidence on test change pixels (mean prob = 0.028) is significantly lower than on val (mean prob = 0.663). 66 of 77 test tiles contain zero change pixels. Root cause is per-image SAR normalization combined with scene-level domain shift. Full analysis in the technical report.
+> **Note:** Test set (scene_09, scene_10) represents unseen disaster events. Diagnostic analysis confirmed severe domain shift — model confidence on true change pixels collapsed from mean prob 0.8286 (val) to 0.0678 (test). Only 17 of 77 test tiles contain zero change pixels. Root cause is scene-level domain shift — test tiles originate from entirely unseen disaster events not represented in training. Full analysis in the technical report.
 
 ---
 
