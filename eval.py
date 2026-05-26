@@ -1,174 +1,201 @@
-import os
-import gc
 import argparse
-import numpy as np
 import torch
-import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
-from tqdm import tqdm
-from dataloader import EOSARDataset, load_config
-from model import SiameseChangeDetector
+from pathlib import Path
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+import json
 
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate EO-SAR Change Detection Model")
-    parser.add_argument("--data_path", type=str, required=True,
-                        help="Path to dataset split directory (e.g. /path/to/test)")
-    parser.add_argument("--weights", type=str, required=True,
-                        help="Path to model checkpoint (e.g. /path/to/best_model.pth)")
-    parser.add_argument("--config", type=str, default="config.yaml",
-                        help="Path to config YAML file")
-    parser.add_argument("--output_dir", type=str, default="./results",
-                        help="Directory to save results")
-    parser.add_argument("--batch_size", type=int, default=2,
-                        help="Batch size for evaluation")
-    parser.add_argument("--no_tta", action="store_true",
-                        help="Disable TTA (faster but lower accuracy)")
-    return parser.parse_args()
-
-
-def compute_metrics(preds, targets, eps=1e-6):
-    preds   = preds.float().view(-1)
-    targets = targets.float().view(-1)
-    tp = (preds * targets).sum().item()
-    fp = (preds * (1 - targets)).sum().item()
-    fn = ((1 - preds) * targets).sum().item()
-    tn = ((1 - preds) * (1 - targets)).sum().item()
-    precision = tp / (tp + fp + eps)
-    recall    = tp / (tp + fn + eps)
-    f1        = 2 * precision * recall / (precision + recall + eps)
-    iou       = tp / (tp + fp + fn + eps)
-    return {"iou": iou, "precision": precision,
-            "recall": recall, "f1": f1,
-            "tp": tp, "fp": fp, "fn": fn, "tn": tn}
+from model import ChangeDetectionModel
+from dataset import ChangeDetectionDataset
 
 
 def tta_predict(model, eo, sar, device):
-    """10-fold TTA: 4 rotations x 2 flips + 2 scale variations."""
+    """10-fold TTA: 4 rotations x 2 flips."""
+    eo  = eo.to(device)
+    sar = sar.to(device)
     preds = []
-    h, w  = eo.shape[-2], eo.shape[-1]
-
     for k in range(4):
+        eo_r  = torch.rot90(eo,  k, dims=[2, 3])
+        sar_r = torch.rot90(sar, k, dims=[2, 3])
         for flip in [False, True]:
-            eo_t  = torch.rot90(eo,  k, dims=[2, 3])
-            sar_t = torch.rot90(sar, k, dims=[2, 3])
-            if flip:
-                eo_t  = torch.flip(eo_t,  [3])
-                sar_t = torch.flip(sar_t, [3])
+            eo_f  = torch.flip(eo_r,  [3]) if flip else eo_r
+            sar_f = torch.flip(sar_r, [3]) if flip else sar_r
             with torch.no_grad():
-                with torch.amp.autocast("cuda"):
-                    out  = model(eo_t.to(device), sar_t.to(device))
-                    if isinstance(out, tuple):
-                        out = out[0]
-                    prob = torch.sigmoid(out).cpu()
+                pred = torch.sigmoid(model(eo_f, sar_f, training=False))
             if flip:
-                prob = torch.flip(prob, [3])
-            preds.append(torch.rot90(prob, -k, dims=[2, 3]))
-
-    for scale in [0.875, 1.125]:
-        nh, nw = int(h * scale), int(w * scale)
-        eo_s  = F.interpolate(eo,  size=(nh, nw), mode="bilinear", align_corners=False)
-        sar_s = F.interpolate(sar, size=(nh, nw), mode="bilinear", align_corners=False)
-        with torch.no_grad():
-            with torch.amp.autocast("cuda"):
-                out  = model(eo_s.to(device), sar_s.to(device))
-                if isinstance(out, tuple):
-                    out = out[0]
-                prob = torch.sigmoid(out).cpu()
-        prob = F.interpolate(prob, size=(h, w), mode="bilinear", align_corners=False)
-        preds.append(prob)
-
-    return torch.stack(preds).mean(dim=0)
+                pred = torch.flip(pred, [3])
+            pred = torch.rot90(pred, -k, dims=[2, 3])
+            preds.append(pred.cpu())
+    return torch.stack(preds).mean(0)
 
 
-def simple_predict(model, eo, sar, device):
-    """Single forward pass without TTA."""
-    with torch.no_grad():
-        with torch.amp.autocast("cuda"):
-            out = model(eo.to(device), sar.to(device))
-            if isinstance(out, tuple):
-                out = out[0]
-            prob = torch.sigmoid(out).cpu()
-    return prob
+def evaluate(model, loader, device, threshold=0.5, use_tta=True):
+    all_probs, all_preds, all_targets = [], [], []
+
+    for eo, sar, mask in loader:
+        if use_tta:
+            prob = tta_predict(model, eo, sar, device)
+        else:
+            eo, sar = eo.to(device), sar.to(device)
+            with torch.no_grad():
+                prob = torch.sigmoid(
+                    model(eo, sar, training=False)).cpu()
+
+        pred = (prob > threshold).float()
+        all_probs.append(prob.numpy())
+        all_preds.append(pred.numpy())
+        all_targets.append(mask.numpy())
+
+    all_probs   = np.concatenate(all_probs,   axis=0)
+    all_preds   = np.concatenate(all_preds,   axis=0)
+    all_targets = np.concatenate(all_targets, axis=0)
+
+    p_flat = all_preds[:, 0].flatten().astype(int)
+    t_flat = all_targets.flatten().astype(int)
+
+    tp = ((p_flat == 1) & (t_flat == 1)).sum()
+    fp = ((p_flat == 1) & (t_flat == 0)).sum()
+    fn = ((p_flat == 0) & (t_flat == 1)).sum()
+    tn = ((p_flat == 0) & (t_flat == 0)).sum()
+
+    precision = tp / (tp + fp + 1e-6)
+    recall    = tp / (tp + fn + 1e-6)
+    f1        = 2 * precision * recall / (precision + recall + 1e-6)
+    iou       = tp / (tp + fp + fn + 1e-6)
+
+    return {
+        "f1": float(f1), "iou": float(iou),
+        "precision": float(precision), "recall": float(recall),
+        "tp": int(tp), "fp": int(fp), "fn": int(fn), "tn": int(tn),
+        "probs": all_probs, "preds": all_preds, "targets": all_targets
+    }
 
 
 def main():
-    args   = parse_args()
-    config = load_config(args.config)
+    parser = argparse.ArgumentParser(
+        description="Evaluate EO-SAR change detection model")
+    parser.add_argument("--data_path", type=str, required=True,
+                        help="Path to test data folder")
+    parser.add_argument("--weights",   type=str, required=True,
+                        help="Path to model checkpoint (.pth)")
+    parser.add_argument("--threshold", type=float, default=0.5,
+                        help="Prediction threshold (default: 0.5)")
+    parser.add_argument("--no_tta",    action="store_true",
+                        help="Disable test time augmentation")
+    parser.add_argument("--batch_size",type=int, default=4,
+                        help="Batch size (default: 4)")
+    parser.add_argument("--output_dir",type=str, default="eval_output",
+                        help="Directory to save output figures")
+    args = parser.parse_args()
+
+    # Setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # ── Load model ─────────────────────────────────────────────
-    model = SiameseChangeDetector(pretrained=False, deep_supervision=True).to(device)
-    ckpt  = torch.load(args.weights, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(exist_ok=True)
+
+    # Load dataset
+    dataset = ChangeDetectionDataset(
+        data_path=args.data_path,
+        split="test"
+    )
+    loader = DataLoader(
+        dataset, batch_size=args.batch_size,
+        shuffle=False, num_workers=2, pin_memory=True
+    )
+
+    # Load model
+    model = ChangeDetectionModel().to(device)
+    checkpoint = torch.load(args.weights, map_location=device,
+                            weights_only=False)
+    model.load_state_dict(checkpoint["model_state"])
     model.eval()
-    print(f"Loaded checkpoint from epoch {ckpt.get('epoch', 'N/A')}")
-    print(f"Val F1 at save time: {ckpt.get('val_f1', 'N/A'):.4f}")
+    print(f"Loaded checkpoint (epoch {checkpoint['epoch']}, "
+          f"Val F1={checkpoint['val_f1']:.4f})")
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    # Evaluate
+    use_tta = not args.no_tta
+    print(f"\nRunning evaluation (TTA={'ON' if use_tta else 'OFF'})...")
+    results = evaluate(model, loader, device,
+                       threshold=args.threshold, use_tta=use_tta)
 
-    # ── Dataset ────────────────────────────────────────────────
-    dataset = EOSARDataset(args.data_path,
-                           image_size=config["data"]["image_size"],
-                           augment=False)
-    loader  = DataLoader(dataset, batch_size=args.batch_size,
-                         shuffle=False, num_workers=2, pin_memory=False)
+    # Print metrics
+    print("\n" + "="*50)
+    print("EVALUATION RESULTS")
+    print("="*50)
+    print(f"F1 Score:  {results['f1']:.4f}")
+    print(f"IoU:       {results['iou']:.4f}")
+    print(f"Precision: {results['precision']:.4f}")
+    print(f"Recall:    {results['recall']:.4f}")
+    print(f"Threshold: {args.threshold}")
+    print(f"TTA:       {'ON' if use_tta else 'OFF'}")
 
-    predict_fn = simple_predict if args.no_tta else tta_predict
-    mode_str   = "No TTA" if args.no_tta else "10-fold TTA"
-    print(f"\nEvaluating {len(dataset)} samples with {mode_str}...")
+    # Save metrics
+    metrics_out = {
+        "f1":        round(results["f1"],        4),
+        "iou":       round(results["iou"],       4),
+        "precision": round(results["precision"], 4),
+        "recall":    round(results["recall"],    4),
+        "threshold": args.threshold,
+        "tta":       use_tta
+    }
+    with open(output_dir / "metrics.json", "w") as f:
+        json.dump(metrics_out, f, indent=2)
+    print(f"\nMetrics saved to {output_dir}/metrics.json")
 
-    # ── Collect predictions ────────────────────────────────────
-    all_probs = []
-    all_masks = []
-    for eo, sar, masks, _ in tqdm(loader, desc="Evaluating"):
-        probs = predict_fn(model, eo, sar, device)
-        all_probs.append(probs)
-        all_masks.append(masks)
-        gc.collect()
-        torch.cuda.empty_cache()
+    # Confusion matrix
+    cm = np.array([[results["tn"], results["fp"]],
+                   [results["fn"], results["tp"]]])
+    fig, ax = plt.subplots(figsize=(6, 5))
+    disp = ConfusionMatrixDisplay(
+        cm, display_labels=["No Change", "Change"])
+    disp.plot(ax=ax, colorbar=False, cmap="Blues")
+    ax.set_title("Confusion Matrix (Test Split)")
+    plt.tight_layout()
+    plt.savefig(output_dir / "confusion_matrix.png", dpi=150)
+    plt.close()
+    print(f"Confusion matrix saved to {output_dir}/confusion_matrix.png")
 
-    all_probs = torch.cat(all_probs)
-    all_masks  = torch.cat(all_masks)
+    # Prediction visualisations (6 samples)
+    EO_MEAN = np.array([0.485, 0.456, 0.406])
+    EO_STD  = np.array([0.229, 0.224, 0.225])
+    SAR_MEAN, SAR_STD = 2.9777, 1.7104
 
-    # ── Threshold sweep ────────────────────────────────────────
-    print(f"\n{'Threshold':>10} | {'IoU':>6} | {'Precision':>9} | {'Recall':>6} | {'F1':>6}")
-    print("-" * 55)
-    best_f1, best_thresh, best_metrics = 0, 0.5, None
+    samples = list(dataset)
+    indices = np.linspace(0, len(samples)-1, 6, dtype=int)
 
-    for thresh in np.arange(0.05, 0.96, 0.05):
-        preds   = (all_probs > thresh).float()
-        metrics = compute_metrics(preds, all_masks)
-        marker  = " ←" if metrics["f1"] > best_f1 else ""
-        print(f"  {thresh:.2f}     | "
-              f"{metrics['iou']:.4f} | "
-              f"{metrics['precision']:.4f}    | "
-              f"{metrics['recall']:.4f} | "
-              f"{metrics['f1']:.4f}{marker}")
-        if metrics["f1"] > best_f1:
-            best_f1      = metrics["f1"]
-            best_thresh  = thresh
-            best_metrics = metrics
+    fig, axes = plt.subplots(6, 4, figsize=(14, 21))
+    axes[0, 0].set_title("EO (pre-event)")
+    axes[0, 1].set_title("SAR (post-event)")
+    axes[0, 2].set_title("Ground Truth")
+    axes[0, 3].set_title("Prediction")
 
-    print(f"\nBest threshold: {best_thresh:.2f} → "
-          f"F1: {best_f1:.4f} | IoU: {best_metrics['iou']:.4f} | "
-          f"P: {best_metrics['precision']:.4f} | R: {best_metrics['recall']:.4f}")
+    for row, idx in enumerate(indices):
+        eo, sar, mask = samples[idx]
+        prob = results["probs"][idx, 0]
+        pred = (prob > args.threshold).astype(float)
 
-    # ── Save metrics ───────────────────────────────────────────
-    split_name = os.path.basename(args.data_path.rstrip("/"))
-    out_path   = os.path.join(args.output_dir, f"metrics_{split_name}.txt")
-    with open(out_path, "w") as f:
-        f.write(f"Data path:  {args.data_path}\n")
-        f.write(f"Weights:    {args.weights}\n")
-        f.write(f"Mode:       {mode_str}\n")
-        f.write(f"Threshold:  {best_thresh:.2f}\n")
-        f.write(f"IoU:        {best_metrics['iou']:.4f}\n")
-        f.write(f"Precision:  {best_metrics['precision']:.4f}\n")
-        f.write(f"Recall:     {best_metrics['recall']:.4f}\n")
-        f.write(f"F1:         {best_metrics['f1']:.4f}\n")
-    print(f"\nMetrics saved to {out_path}")
-    print("Done!")
+        eo_disp  = np.clip(
+            eo.numpy().transpose(1,2,0) * EO_STD + EO_MEAN, 0, 1)
+        sar_disp = np.clip(
+            np.expm1(sar.numpy()[0] * SAR_STD + SAR_MEAN) / 238.0, 0, 1)
+
+        axes[row, 0].imshow(eo_disp)
+        axes[row, 1].imshow(sar_disp, cmap="gray")
+        axes[row, 2].imshow(mask.numpy(), cmap="Reds", vmin=0, vmax=1)
+        axes[row, 3].imshow(pred,         cmap="Reds", vmin=0, vmax=1)
+        for col in range(4):
+            axes[row, col].axis("off")
+
+    plt.suptitle("Test Predictions", fontsize=13)
+    plt.tight_layout()
+    plt.savefig(output_dir / "predictions.png", dpi=150)
+    plt.close()
+    print(f"Predictions saved to {output_dir}/predictions.png")
+    print("\nDone ✅")
 
 
 if __name__ == "__main__":
