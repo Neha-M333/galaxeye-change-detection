@@ -110,5 +110,3 @@ python eval.py --data_path /path/to/test \
 - Salehi et al. (2017). *Tversky Loss Function for Image Segmentation.* MICCAI Workshop.
 
 ---
-
-*Neha M — GalaxEye Space AI Research Intern Technical Assignment*
